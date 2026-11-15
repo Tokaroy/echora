@@ -7026,17 +7026,22 @@ impl Nvn {
 
     /// Execute a draw command on the GPU.
     pub(super) fn gpu_draw(&mut self, core: &mut Guest, command: &Command) -> Result<(), String> {
-        // Time spent in each phase (stats, microseconds).
-        let phase_start = std::time::Instant::now();
-        let phase = |nvn: &mut Self, name: &'static str, since: &mut std::time::Instant| {
+        // Time spent in each phase (stats, microseconds), measured only
+        // when GPU timing or the timeline is on: the clock reads were ~4%
+        // of the replay thread's time.
+        let timing = draw_phase_timing();
+        let phase = |nvn: &mut Self, name: &'static str, since: &mut Option<std::time::Instant>| {
+            let Some(previous) = since.as_mut() else {
+                return;
+            };
             let now = std::time::Instant::now();
             nvn.gpu
                 .as_mut()
                 .unwrap()
-                .stat(name, (now - *since).as_micros() as u64);
-            *since = now;
+                .stat(name, (now - *previous).as_micros() as u64);
+            *previous = now;
         };
-        let mut since = phase_start;
+        let mut since = timing.then(std::time::Instant::now);
         let mesh_draw = command.name.contains("DrawMeshTasks");
         let ((keys, stages), slots, mesh_entries) = if mesh_draw {
             self.bound_mesh_program(core)?
@@ -7283,8 +7288,8 @@ impl Nvn {
         for (index, stage) in stages.iter().enumerate() {
             let nvn = slots[index];
             for descriptor in &stage.descriptors {
-                let now = std::time::Instant::now();
-                if let Some((kind, since)) = binding_lap {
+                let now = timing.then(std::time::Instant::now);
+                if let (Some((kind, since)), Some(now)) = (binding_lap, now) {
                     binding_times[kind] += now - since;
                 }
                 let kind = match descriptor.kind() {
@@ -7298,7 +7303,7 @@ impl Nvn {
                     DescriptorKind::Texture | DescriptorKind::TextureBuffer => 3,
                     _ => 4,
                 };
-                binding_lap = Some((kind, now));
+                binding_lap = now.map(|now| (kind, now));
                 match descriptor.kind() {
                     // Constant bank 24: root table 0 of the graphics
                     // pipeline (PushGraphicsConstants).
@@ -7336,9 +7341,11 @@ impl Nvn {
                         let size = bind.x[4].min(used.max(16)).min(64 << 10);
                         let address = bind.x[3];
                         self.resolve_gpu(core, address, size)?;
-                        let started = std::time::Instant::now();
+                        let started = timing.then(std::time::Instant::now);
                         let bytes = self.gpu_bytes(core, address, size)?;
-                        uniform_time += started.elapsed();
+                        if let Some(started) = started {
+                            uniform_time += started.elapsed();
+                        }
                         uniform_bytes += bytes.len() as u64;
                         uniforms.insert((index, descriptor.binding), bytes);
                     }
@@ -7493,7 +7500,7 @@ impl Nvn {
                             .as_mut()
                             .unwrap()
                             .stat("stat: texture binding memo misses", 1);
-                        let started = std::time::Instant::now();
+                        let started = timing.then(std::time::Instant::now);
                         let texture = self.handle_texture(handle).map_err(|error| {
                             format!(
                                 "{error} ({:?} stage {:016x}, binding {})",
@@ -7513,7 +7520,9 @@ impl Nvn {
                             self.resolve_storage(core, Some(storage.clone()))?;
                         }
                         let source = self.texture_source(core, texture)?;
-                        texture_time += started.elapsed();
+                        if let Some(started) = started {
+                            texture_time += started.elapsed();
+                        }
                         let source = self.through_view(source, handle);
                         if let Some(swizzle) = self.handle_swizzle(handle) {
                             if super::debug_var_os("ECHORA_GPU_FLOW").is_some() {
@@ -7556,7 +7565,7 @@ impl Nvn {
         if let Some((kind, since)) = binding_lap.take() {
             binding_times[kind] += since.elapsed();
         }
-        let tail_started = std::time::Instant::now();
+        let tail_started = timing.then(std::time::Instant::now);
         // Each stage's c0 holds its bound storage buffers' addresses and
         // sizes (slot i at the stage's table + 16 * i, `c0_storage_table`),
         // as the driver keeps them: a program that
@@ -7620,7 +7629,7 @@ impl Nvn {
                 }
             }
         }
-        let pool_started = std::time::Instant::now();
+        let pool_started = timing.then(std::time::Instant::now);
         // Texture pool entries, for stages that read the pool.
         // One stage's list is shared as it is (unchanged lists are then
         // known without comparing); several are joined.
@@ -7637,14 +7646,16 @@ impl Nvn {
         };
         {
             let backend = self.gpu.as_mut().unwrap();
-            backend.stat(
-                "stat: draw ns driver words",
-                (pool_started - tail_started).as_nanos() as u64,
-            );
-            backend.stat(
-                "stat: draw ns texture pool entries",
-                pool_started.elapsed().as_nanos() as u64,
-            );
+            if let (Some(tail_started), Some(pool_started)) = (tail_started, pool_started) {
+                backend.stat(
+                    "stat: draw ns driver words",
+                    (pool_started - tail_started).as_nanos() as u64,
+                );
+                backend.stat(
+                    "stat: draw ns texture pool entries",
+                    pool_started.elapsed().as_nanos() as u64,
+                );
+            }
             backend.stat("stat: texture binding memo hits", memo_hits);
             for (name, time) in [
                 "stat: draw ns binding uniform buffers",
@@ -7655,6 +7666,7 @@ impl Nvn {
             ]
             .into_iter()
             .zip(binding_times)
+            .filter(|_| timing)
             {
                 backend.stat(name, time.as_nanos() as u64);
             }
@@ -7662,10 +7674,12 @@ impl Nvn {
         phase(self, "stat: draw us bindings", &mut since);
         {
             let backend = self.gpu.as_mut().unwrap();
-            let time: std::time::Duration = uniform_time;
-            backend.stat("stat: draw us uniform reads", time.as_micros() as u64);
-            let time: std::time::Duration = texture_time;
-            backend.stat("stat: draw us texture sources", time.as_micros() as u64);
+            if timing {
+                let time: std::time::Duration = uniform_time;
+                backend.stat("stat: draw us uniform reads", time.as_micros() as u64);
+                let time: std::time::Duration = texture_time;
+                backend.stat("stat: draw us texture sources", time.as_micros() as u64);
+            }
             backend.stat("stat: draw uniform bytes", uniform_bytes);
         }
         // Vertex input from the snapshot states and bound streams.
@@ -8908,7 +8922,7 @@ impl Nvn {
             .collect();
         let (draw_count, draw_instances) = (draw.count, draw.instances);
         let probe_level = draw.color_levels.first().copied().unwrap_or(0);
-        let setup_end = std::time::Instant::now();
+        let setup_end = timing.then(std::time::Instant::now);
         if echora_gpu::renderer::Renderer::labelling() {
             let label = format!(
                 "present {} draw {:016x}/{:016x} count {} instances {} colors {:x?} depth {:x?} reads [{}]",
@@ -8947,10 +8961,12 @@ impl Nvn {
                 .entry("stat: draw storage results".into())
                 .or_default() += storage_results;
         }
-        let timings = [
-            (setup_end - since).as_micros() as u64,
-            setup_end.elapsed().as_micros() as u64,
-        ];
+        let timings = setup_end.zip(since).map(|(setup_end, since)| {
+            [
+                (setup_end - since).as_micros() as u64,
+                setup_end.elapsed().as_micros() as u64,
+            ]
+        });
         let draw_label = format!("draw {:016x}/{:016x}", keys.0, keys.1);
         // ECHORA_GPU_UPLOAD_DUMP=<dir> with a traced program: each level of
         // the uploads it samples, once, as upload-<key>-<level>.ppm (RGB)
@@ -9097,8 +9113,10 @@ impl Nvn {
             }
         }
         let backend = self.gpu.as_mut().unwrap();
-        backend.stat("stat: draw us setup", timings[0]);
-        backend.stat("stat: draw us renderer", timings[1]);
+        if let Some([setup, renderer]) = timings {
+            backend.stat("stat: draw us setup", setup);
+            backend.stat("stat: draw us renderer", renderer);
+        }
         if let Some((stages, uniforms, textures, page_table)) = stage_dump.as_ref()
             && !mesh_draw
         {
@@ -9617,6 +9635,15 @@ fn dump_directory_at(key: u64, present: u64) -> Result<std::path::PathBuf, Strin
             .join("echora/dispatch-dumps"),
     };
     Ok(root.join(format!("{key:016x}-{present}")))
+}
+
+/// Whether gpu_draw measures its phases (the "stat: draw us/ns ..."
+/// lines): with ECHORA_GPU_TIME (not 0) or the timeline on, as the
+/// renderer's own GPU timing.
+fn draw_phase_timing() -> bool {
+    static GPU_TIME: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GPU_TIME.get_or_init(|| std::env::var_os("ECHORA_GPU_TIME").is_some_and(|value| value != "0"))
+        || crate::timeline::on()
 }
 
 /// The render state's key for a binding of `kind` (stage `stage`, if any)
