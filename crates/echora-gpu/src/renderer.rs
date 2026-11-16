@@ -440,6 +440,34 @@ struct Slot {
     /// slot's command buffer, and began inside its open rendering pass.
     condition_active: bool,
     condition_inside: bool,
+    /// Descriptor sets already written in this slot's pool, by their
+    /// layout and writes (`Renderer::reuse_set`); cleared with the pool.
+    sets: FastMap<SetKey, vk::DescriptorSet>,
+}
+
+/// One descriptor write as a set cache key (`SetKey`): the binding, its
+/// type and what it names (raw handles; the buffer offset is 0 for a
+/// dynamic uniform buffer, whose offset is given at bind time).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct WriteKey {
+    pub binding: u32,
+    pub kind: i32,
+    pub buffer: u64,
+    pub offset: u64,
+    pub range: u64,
+    pub view: u64,
+    pub sampler: u64,
+    pub texel_view: u64,
+}
+
+/// A set layout and every write of a set made from it.
+pub(crate) type SetKey = (u64, Vec<WriteKey>);
+
+/// ECHORA_DESCRIPTOR_REUSE=0: every draw writes a set of its own and
+/// programs keep plain uniform buffers (as before set reuse).
+pub(crate) fn descriptor_reuse() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ECHORA_DESCRIPTOR_REUSE").is_none_or(|value| value != "0"))
 }
 
 impl Slot {
@@ -556,6 +584,12 @@ fn create_descriptor_pool(device: &ash::Device) -> Result<vk::DescriptorPool, St
             ty: vk::DescriptorType::UNIFORM_BUFFER,
             descriptor_count: MAX_SETS * 8,
         },
+        // Counted with the uniform buffers (`reserve`): a draw's program
+        // has either kind.
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
+            descriptor_count: MAX_SETS * 8,
+        },
         vk::DescriptorPoolSize {
             ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
             descriptor_count: MAX_SETS * 16,
@@ -669,6 +703,7 @@ impl Renderer {
                 in_flight: false,
                 serial: 0,
                 markers: Vec::new(),
+                sets: FastMap::default(),
                 open_pass: None,
                 condition_active: false,
                 condition_inside: false,
@@ -762,6 +797,7 @@ impl Renderer {
                 in_flight: false,
                 serial: 0,
                 markers: Vec::new(),
+                sets: FastMap::default(),
                 open_pass: None,
                 condition_active: false,
                 condition_inside: false,
@@ -798,6 +834,17 @@ impl Renderer {
             renderer.spares[index].ring = ring;
         }
         Ok(renderer)
+    }
+
+    /// A set already written in the recorded slot's pool with `key`'s
+    /// layout and writes (the slot's work then reuses it).
+    pub(crate) fn slot_set(&self, key: &SetKey) -> Option<vk::DescriptorSet> {
+        self.slot.sets.get(key).copied()
+    }
+
+    /// Remember `set`, written with `key`, until the slot's pool is reset.
+    pub(crate) fn keep_slot_set(&mut self, key: SetKey, set: vk::DescriptorSet) {
+        self.slot.sets.insert(key, set);
     }
 
     /// Whether a rendering pass is open in the recorded slot.
@@ -2826,6 +2873,8 @@ impl Renderer {
                 )
                 .map_err(vk_error("vkResetDescriptorPool"))?;
         }
+        // Its sets went with the pool.
+        self.slot.sets.clear();
         self.slot.in_flight = false;
         // Its markers are passed: their events are reset for reuse.
         for id in std::mem::take(&mut self.slot.markers) {

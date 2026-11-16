@@ -33,6 +33,10 @@ pub struct Program {
     /// A stage reads the texture pool: set 1 is the renderer's pool set
     /// (`Renderer::bind_pool`).
     pub(crate) pool: bool,
+    /// Its uniform buffers are dynamic in `layout`: their ring offsets are
+    /// given when the set is bound, so one set serves draws whose uniforms
+    /// moved (`Renderer::reuse_set`).
+    pub(crate) dynamic_uniforms: bool,
 }
 
 /// Bytes of the recompiler's rescaling push constants (RescalingLayout:
@@ -462,7 +466,25 @@ impl Renderer {
                 descriptors.push((*descriptor, stage_flags(stage.stage)));
             }
         }
-        let layout = self.gpu.descriptor_set_layout_for(&descriptors)?;
+        // Dynamic uniform buffers where the device takes them all (a set's
+        // limit; a program over it keeps plain ones).
+        let uniforms = descriptors
+            .iter()
+            .filter(|(descriptor, _)| descriptor.kind() == DescriptorKind::UniformBuffer)
+            .count() as u32;
+        let dynamic_uniforms = crate::renderer::descriptor_reuse() && uniforms > 0 && {
+            // SAFETY: the physical device belongs to the live instance.
+            let limits = unsafe {
+                self.gpu
+                    .instance
+                    .get_physical_device_properties(self.gpu.physical)
+            }
+            .limits;
+            uniforms <= limits.max_descriptor_set_uniform_buffers_dynamic
+        };
+        let layout = self
+            .gpu
+            .descriptor_set_layout_with(&descriptors, dynamic_uniforms)?;
         let pool = stages.iter().any(|stage| stage.texture_pool_bindings != 0);
         let mut layouts = vec![layout];
         if pool {
@@ -620,7 +642,10 @@ impl Renderer {
             self.shader_cache.as_deref(),
             self.gpu.shader_binary_version,
             &infos,
-            &format!("{descriptors:?} {push_ranges:?} {compute_32} {specialization:?} {pool}"),
+            &format!(
+                "{descriptors:?} {push_ranges:?} {compute_32} {specialization:?} {pool}{}",
+                if dynamic_uniforms { " dynamic" } else { "" }
+            ),
         )?;
         Ok(Program {
             stages,
@@ -631,6 +656,7 @@ impl Renderer {
             texture_bits,
             abi_stages,
             pool,
+            dynamic_uniforms,
         })
     }
 
@@ -735,6 +761,8 @@ impl Renderer {
         )> = Vec::new();
         let mut texel_views: HashMap<u32, vk::BufferView> = HashMap::new();
         let mut written = Vec::new();
+        // Dynamic uniform buffers' ring offsets, by binding.
+        let mut dynamic_offsets: Vec<(u32, u32)> = Vec::new();
         for (stage_index, stage) in program.stages.iter().enumerate() {
             for descriptor in &stage.descriptors {
                 let key = (stage_index, descriptor.binding);
@@ -762,9 +790,15 @@ impl Renderer {
                             }
                         };
                         let range = (length as u64).max(16).next_multiple_of(16);
+                        let (kind, offset) = if program.dynamic_uniforms {
+                            dynamic_offsets.push((descriptor.binding, offset as u32));
+                            (vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC, 0)
+                        } else {
+                            (vk::DescriptorType::UNIFORM_BUFFER, offset)
+                        };
                         writes.push((
                             descriptor.binding,
-                            vk::DescriptorType::UNIFORM_BUFFER,
+                            kind,
                             Some(vk::DescriptorBufferInfo {
                                 buffer,
                                 offset,
@@ -848,7 +882,32 @@ impl Renderer {
             }
         }
         self.lap("stat: renderer ns uniforms storage textures", &mut since);
-        let set = self.descriptor_set(program.layout)?;
+        let reuse_key = crate::renderer::descriptor_reuse().then(|| {
+            let writes = writes
+                .iter()
+                .map(|(binding, kind, buffer, image)| {
+                    use ash::vk::Handle;
+                    let buffer = buffer.unwrap_or_default();
+                    let image = image.unwrap_or_default();
+                    crate::renderer::WriteKey {
+                        binding: *binding,
+                        kind: kind.as_raw(),
+                        buffer: buffer.buffer.as_raw(),
+                        offset: buffer.offset,
+                        range: buffer.range,
+                        view: image.image_view.as_raw(),
+                        sampler: image.sampler.as_raw(),
+                        texel_view: texel_views.get(binding).map_or(0, |view| view.as_raw()),
+                    }
+                })
+                .collect();
+            (ash::vk::Handle::as_raw(program.layout), writes)
+        });
+        let reused = reuse_key.as_ref().and_then(|key| self.slot_set(key));
+        let set = match reused {
+            Some(set) => set,
+            None => self.descriptor_set(program.layout)?,
+        };
         let texel_infos: Vec<[vk::BufferView; 1]> = writes
             .iter()
             .map(|write| [texel_views.get(&write.0).copied().unwrap_or_default()])
@@ -878,12 +937,25 @@ impl Renderer {
                 }
             })
             .collect();
-        // SAFETY: the set and resources are live.
-        unsafe {
-            self.gpu
-                .device
-                .update_descriptor_sets(&descriptor_writes, &[])
-        };
+        if reused.is_none() {
+            // SAFETY: the set and resources are live.
+            unsafe {
+                self.gpu
+                    .device
+                    .update_descriptor_sets(&descriptor_writes, &[])
+            };
+            if let Some(key) = reuse_key {
+                self.keep_slot_set(key, set);
+            }
+        } else {
+            *self
+                .stats
+                .entry("stat: descriptor sets reused")
+                .or_default() += 1;
+        }
+        // Bound in binding order, as Vulkan takes dynamic offsets.
+        dynamic_offsets.sort_unstable();
+        let dynamic_offsets: Vec<u32> = dynamic_offsets.iter().map(|(_, offset)| *offset).collect();
         self.lap("stat: renderer ns descriptor set", &mut since);
         // Vertex streams and indices.
         let mut vertex_buffers = Vec::new();
@@ -1134,7 +1206,7 @@ impl Renderer {
                 program.pipeline_layout,
                 0,
                 &[set],
-                &[],
+                &dynamic_offsets,
             );
             if let Some(pool) = pool {
                 device.cmd_bind_descriptor_sets(

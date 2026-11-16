@@ -98,6 +98,9 @@ impl Renderer {
         }
         self.reserve(bytes, descriptors)?;
         let mut writes = Vec::new();
+        // Dynamic uniform buffers' ring offsets, by binding
+        // (`Program::dynamic_uniforms`).
+        let mut dynamic_offsets: Vec<(u32, u32)> = Vec::new();
         let mut images = Vec::new();
         let mut storage_images = Vec::new();
         let mut storage = Vec::new();
@@ -191,6 +194,13 @@ impl Renderer {
             if kind == vk::DescriptorType::STORAGE_BUFFER && descriptor.flags & 1 != 0 {
                 storage.push((binding, offset, bytes.len()));
             }
+            let (kind, offset) =
+                if kind == vk::DescriptorType::UNIFORM_BUFFER && program.dynamic_uniforms {
+                    dynamic_offsets.push((binding, offset as u32));
+                    (vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC, 0)
+                } else {
+                    (kind, offset)
+                };
             writes.push((
                 binding,
                 kind,
@@ -201,6 +211,9 @@ impl Renderer {
                 }],
             ));
         }
+        // Bound in binding order, as Vulkan takes dynamic offsets.
+        dynamic_offsets.sort_unstable();
+        let dynamic_offsets: Vec<u32> = dynamic_offsets.iter().map(|(_, offset)| *offset).collect();
         let set = self.descriptor_set(program.layout)?;
         let descriptor_writes: Vec<_> = writes
             .iter()
@@ -310,7 +323,7 @@ impl Renderer {
                 program.pipeline_layout,
                 0,
                 &[set],
-                &[],
+                &dynamic_offsets,
             );
             if let Some(pool) = pool {
                 device.cmd_bind_descriptor_sets(

@@ -540,10 +540,24 @@ impl Gpu {
         &self,
         descriptors: &[(Descriptor, vk::ShaderStageFlags)],
     ) -> Result<vk::DescriptorSetLayout, String> {
+        self.descriptor_set_layout_with(descriptors, false)
+    }
+
+    /// `descriptor_set_layout_for`, with the uniform buffers dynamic when
+    /// `dynamic_uniforms` (their ring offsets given when the set is bound,
+    /// so a set written once serves draws whose uniforms moved).
+    pub fn descriptor_set_layout_with(
+        &self,
+        descriptors: &[(Descriptor, vk::ShaderStageFlags)],
+        dynamic_uniforms: bool,
+    ) -> Result<vk::DescriptorSetLayout, String> {
         let bindings: Vec<_> = descriptors
             .iter()
             .map(|(descriptor, stages)| {
                 let kind = match descriptor.kind() {
+                    DescriptorKind::UniformBuffer if dynamic_uniforms => {
+                        vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC
+                    }
                     DescriptorKind::UniformBuffer => vk::DescriptorType::UNIFORM_BUFFER,
                     DescriptorKind::StorageBuffer => vk::DescriptorType::STORAGE_BUFFER,
                     DescriptorKind::TextureBuffer => vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
